@@ -9,6 +9,7 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
+- Multi-Query Attention (MQA) option for maximum KV cache compression
 - Flash Attention 3 integration
 """
 
@@ -38,6 +39,13 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Multi-Query Attention: use single KV head for all query heads that can be shared across multiple query heads, 
+    # Reduces KV cache by n_head times 
+    use_mqa: bool = False
+    
+    def __post_init__(self):
+        if self.use_mqa:
+            self.n_kv_head = 1
 
 
 def norm(x):
