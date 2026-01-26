@@ -84,9 +84,40 @@ python -m scripts.train_distill \
 
 **Note:** Multi-token heads and draft head are disabled during distillation (set to 0) since they don't get training signal from the teacher's main logits.
 
+### 5. Structured Pruning
+
+Added infrastructure to remove entire attention heads and MLP neurons based on L1 importance scores.
+
+**How it works:**
+1. Compute L1 norm importance for each attention head and MLP neuron
+2. Remove the least important heads/neurons (e.g., bottom 20%)
+3. Create a new model with reduced dimensions
+4. Copy relevant weight slices from the original model
+
+**Why this matters:** Structured pruning reduces model size by 30-50% with minimal quality loss. The pruned model can then be fine-tuned with distillation to recover most of the quality.
+
+```bash
+# Prune a trained model
+python -m scripts.prune_model \
+    --model-tag d12 \
+    --head-prune-ratio 0.2 \
+    --neuron-prune-ratio 0.2
+
+# Then fine-tune the pruned model
+python -m scripts.train_distill \
+    --teacher-tag d34 \
+    --model-tag d12_pruned \
+    --source base
+```
+
+**Hyperparameters:**
+- `head_prune_ratio=0.2`: Remove 20% of attention heads (least important)
+- `neuron_prune_ratio=0.2`: Remove 20% of MLP neurons (least important)
+
+**Note:** Pruning reduces `n_head` and `n_embd` uniformly across layers. The pruned model maintains the same architecture but with smaller dimensions.
+
 ## What's next
 
-- Structured pruning (remove entire heads/neurons)
 - INT8 quantization
 
 ## Setup
