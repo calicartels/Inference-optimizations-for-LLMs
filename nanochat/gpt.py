@@ -230,12 +230,14 @@ class GPT(nn.Module):
         for i in range(config.multi_token_n):
             self.multi_token_heads[f"head_{i+2}"] = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Draft head for self-draft speculative decoding
-        self.draft_head = DraftHead(
-            n_embd=config.n_embd,
-            vocab_size=config.vocab_size,  # use actual vocab, not padded
-            draft_n=config.draft_n,
-            hidden_mult=config.draft_hidden_mult
-        )
+        self.draft_head = None
+        if config.draft_n > 0:
+            self.draft_head = DraftHead(
+                n_embd=config.n_embd,
+                vocab_size=config.vocab_size,  # use actual vocab, not padded
+                draft_n=config.draft_n,
+                hidden_mult=config.draft_hidden_mult
+            )
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -279,8 +281,9 @@ class GPT(nn.Module):
         for head in self.multi_token_heads.values():
             torch.nn.init.normal_(head.weight, mean=0.0, std=0.001)
         # Draft head: small std for fc1 (like other projections), zeros for fc2 (starts neutral)
-        torch.nn.init.normal_(self.draft_head.fc1.weight, mean=0.0, std=n_embd**-0.5)
-        torch.nn.init.zeros_(self.draft_head.fc2.weight)  # start with zero output
+        if self.draft_head is not None:
+            torch.nn.init.normal_(self.draft_head.fc1.weight, mean=0.0, std=n_embd**-0.5)
+            torch.nn.init.zeros_(self.draft_head.fc2.weight)  # start with zero output
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -414,7 +417,7 @@ class GPT(nn.Module):
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         multi_token_params = list(self.multi_token_heads.parameters())
-        draft_head_params = list(self.draft_head.parameters())
+        draft_head_params = list(self.draft_head.parameters()) if self.draft_head is not None else []
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(multi_token_params) + len(draft_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
@@ -425,12 +428,14 @@ class GPT(nn.Module):
         adam_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=multi_token_params, lr=unembedding_lr * dmodel_lr_scale),  # same LR as lm_head
-            dict(params=draft_head_params, lr=unembedding_lr * dmodel_lr_scale),  # same LR as lm_head
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
             dict(params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale),  # same LR as token embedding
             dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
             dict(params=x0_params, lr=scalar_lr, betas=(0.96, 0.95)), # higher beta1 for x0 scalars
         ]
+        # Add draft head params if present
+        if draft_head_params:
+            adam_groups.insert(2, dict(params=draft_head_params, lr=unembedding_lr * dmodel_lr_scale))
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
@@ -542,6 +547,7 @@ class GPT(nn.Module):
         This reduces the effective number of forward passes from max_tokens to ~max_tokens / acceptance_rate.
         """
         assert isinstance(tokens, list)
+        assert self.draft_head is not None, "Draft head not available (draft_n=0 in config)"
         device = self.get_device()
         draft_n = self.config.draft_n
         rng = None

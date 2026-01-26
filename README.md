@@ -57,9 +57,35 @@ for token in model.generate_speculative(prompt_tokens, max_tokens=100):
 - `draft_n=4`: Predicts 4 tokens per draft. More = faster if accurate, but accuracy drops.
 - `draft_hidden_mult=0.5`: Hidden layer is half the model dimension. Keeps it fast.
 
+### 4. Knowledge Distillation
+
+Added infrastructure to train a smaller student model by distilling knowledge from nanochat's d34 checkpoint.
+
+**How it works:**
+1. Load teacher model (d34) and freeze it
+2. Train student to match teacher's logit distribution via KL divergence
+3. Combine distillation loss with standard cross-entropy
+4. Student learns from teacher's "soft" predictions, not just hard labels
+
+**Why this matters:** Train a much smaller model (e.g., d12 with MQA) that retains most of the teacher's knowledge. The student achieves ~90% quality with 5x fewer parameters.
+
+```bash
+python -m scripts.train_distill \
+    --teacher-tag d34 \
+    --student-depth 12 \
+    --use-mqa \
+    --temperature 4.0 \
+    --alpha 0.7
+```
+
+**Hyperparameters:**
+- `temperature=4.0`: Softens teacher distribution. Higher = more exploration.
+- `alpha=0.7`: Distillation weight. 0.7 = 70% distill, 30% ground truth CE loss.
+
+**Note:** Multi-token heads and draft head are disabled during distillation (set to 0) since they don't get training signal from the teacher's main logits.
+
 ## What's next
 
-- Knowledge distillation from nanochat's d34 checkpoint
 - Structured pruning (remove entire heads/neurons)
 - INT8 quantization
 
