@@ -35,11 +35,32 @@ loss, logits, mt_logits = model(x, y, return_multi_token=True)
 # mt_logits = {"head_2": ..., "head_3": ..., "head_4": ...}
 ```
 
+### 3. Draft Head for Speculative Decoding
+
+Added a lightweight 2-layer MLP that predicts multiple tokens at once (default: 4 tokens).
+
+**How it works:**
+1. Draft head makes quick guesses for the next N tokens
+2. Main model verifies all N tokens in one parallel forward pass
+3. Keep the longest prefix of correct guesses
+4. Repeat
+
+**Why this speeds things up:** Instead of N sequential forward passes, you do ~2 (draft + verify). If the draft is right 50% of the time, you're already 2x faster. The draft head is tiny (`n_embd * 0.5` hidden dim) so it's basically free.
+
+```python
+# Speculative generation
+for token in model.generate_speculative(prompt_tokens, max_tokens=100):
+    print(token)
+```
+
+**Hyperparameters:**
+- `draft_n=4`: Predicts 4 tokens per draft. More = faster if accurate, but accuracy drops.
+- `draft_hidden_mult=0.5`: Hidden layer is half the model dimension. Keeps it fast.
+
 ## What's next
 
-- Draft head for speculative decoding
-- Knowledge distillation from a larger teacher
-- Structured pruning
+- Knowledge distillation from nanochat's d34 checkpoint
+- Structured pruning (remove entire heads/neurons)
 - INT8 quantization
 
 ## Setup

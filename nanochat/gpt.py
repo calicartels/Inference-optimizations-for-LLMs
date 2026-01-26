@@ -46,6 +46,10 @@ class GPTConfig:
     # Multi-Token Prediction: extra heads predicting future tokens (t+2, t+3, t+4)
     # Improves training signal and enables speculative decoding
     multi_token_n: int = 3  # predicts 3 future tokens (t+2, t+3, t+4)
+    # Draft Head for self-draft speculative decoding
+    # Lightweight MLP that predicts multiple tokens at once for fast drafting
+    draft_n: int = 4  # number of tokens to draft in one shot
+    draft_hidden_mult: float = 0.5  # draft head hidden dim = n_embd * mult (smaller = faster)
     
     def __post_init__(self):
         if self.use_mqa:
@@ -68,6 +72,49 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+class DraftHead(nn.Module):
+    """
+    Lightweight MLP head for self-draft speculative decoding.
+    Predicts multiple tokens at once from the last hidden state.
+    
+    During inference:
+    1. Draft head quickly predicts N draft tokens
+    2. Main model verifies all N tokens in one parallel forward pass
+    3. Accept verified tokens, resample where draft was wrong
+    
+    This amortizes the cost of autoregressive decoding.
+    """
+    def __init__(self, n_embd, vocab_size, draft_n, hidden_mult=0.5):
+        super().__init__()
+        self.draft_n = draft_n
+        hidden_dim = int(n_embd * hidden_mult)
+        # 2-layer MLP: hidden layer + output layer predicting draft_n * vocab_size
+        self.fc1 = nn.Linear(n_embd, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(hidden_dim, draft_n * vocab_size, bias=False)
+        self.vocab_size = vocab_size
+    
+    def forward(self, x):
+        """
+        Args:
+            x: hidden states (B, T, n_embd) or (B, n_embd) for single position
+        Returns:
+            draft_logits: (B, T, draft_n, vocab_size) or (B, draft_n, vocab_size)
+        """
+        squeeze = x.dim() == 2
+        if squeeze:
+            x = x.unsqueeze(1)  # (B, 1, n_embd)
+        
+        B, T, _ = x.shape
+        h = F.relu(self.fc1(x)) ** 2  # ReLU² like the main MLP
+        out = self.fc2(h)  # (B, T, draft_n * vocab_size)
+        out = out.view(B, T, self.draft_n, self.vocab_size)
+        
+        if squeeze:
+            out = out.squeeze(1)  # (B, draft_n, vocab_size)
+        return out
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -182,6 +229,13 @@ class GPT(nn.Module):
         self.multi_token_heads = nn.ModuleDict()
         for i in range(config.multi_token_n):
             self.multi_token_heads[f"head_{i+2}"] = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Draft head for self-draft speculative decoding
+        self.draft_head = DraftHead(
+            n_embd=config.n_embd,
+            vocab_size=config.vocab_size,  # use actual vocab, not padded
+            draft_n=config.draft_n,
+            hidden_mult=config.draft_hidden_mult
+        )
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -224,6 +278,9 @@ class GPT(nn.Module):
         # Multi-token prediction heads (same init as lm_head)
         for head in self.multi_token_heads.values():
             torch.nn.init.normal_(head.weight, mean=0.0, std=0.001)
+        # Draft head: small std for fc1 (like other projections), zeros for fc2 (starts neutral)
+        torch.nn.init.normal_(self.draft_head.fc1.weight, mean=0.0, std=n_embd**-0.5)
+        torch.nn.init.zeros_(self.draft_head.fc2.weight)  # start with zero output
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -357,9 +414,10 @@ class GPT(nn.Module):
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         multi_token_params = list(self.multi_token_heads.parameters())
+        draft_head_params = list(self.draft_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(multi_token_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(multi_token_params) + len(draft_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
         # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -367,6 +425,7 @@ class GPT(nn.Module):
         adam_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=multi_token_params, lr=unembedding_lr * dmodel_lr_scale),  # same LR as lm_head
+            dict(params=draft_head_params, lr=unembedding_lr * dmodel_lr_scale),  # same LR as lm_head
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
             dict(params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale),  # same LR as token embedding
             dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
@@ -467,3 +526,102 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+    @torch.inference_mode()
+    def generate_speculative(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+        """
+        Speculative decoding using self-draft.
+        
+        Algorithm:
+        1. Get hidden state for last token
+        2. Draft head predicts N tokens quickly
+        3. Verify all N+1 positions (original + drafts) in one forward pass
+        4. Accept longest prefix where draft matches verification
+        5. Yield accepted tokens, repeat
+        
+        This reduces the effective number of forward passes from max_tokens to ~max_tokens / acceptance_rate.
+        """
+        assert isinstance(tokens, list)
+        device = self.get_device()
+        draft_n = self.config.draft_n
+        rng = None
+        if temperature > 0:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(seed)
+        
+        ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        tokens_generated = 0
+        
+        while tokens_generated < max_tokens:
+            # Forward pass to get hidden states (we need the raw hidden state for draft head)
+            # Run trunk to get hidden states
+            B, T = ids.size()
+            T0 = 0  # no kv cache for simplicity in this version
+            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+            
+            x = self.transformer.wte(ids)
+            x = norm(x)
+            x0 = x
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](ids) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], None)
+            x = norm(x)
+            
+            # Get hidden state for last position
+            last_hidden = x[:, -1, :]  # (B, n_embd)
+            
+            # Draft N tokens using draft head
+            draft_logits = self.draft_head(last_hidden)  # (B, draft_n, vocab_size)
+            if temperature > 0:
+                draft_logits = draft_logits / temperature
+                draft_probs = F.softmax(draft_logits, dim=-1)
+                draft_tokens = torch.multinomial(draft_probs.view(-1, draft_probs.size(-1)), num_samples=1, generator=rng)
+                draft_tokens = draft_tokens.view(B, draft_n)  # (B, draft_n)
+            else:
+                draft_tokens = torch.argmax(draft_logits, dim=-1)  # (B, draft_n)
+            
+            # Prepare verification sequence: original + draft tokens
+            verify_ids = torch.cat([ids, draft_tokens], dim=1)  # (B, T + draft_n)
+            
+            # Verify all draft tokens with full model in one forward pass
+            verify_logits = self.forward(verify_ids)  # (B, T + draft_n, vocab_size)
+            
+            # Sample from verification logits for positions T-1 to T+draft_n-1
+            # Position T-1 verifies the first draft token, etc.
+            accepted = []
+            for i in range(draft_n):
+                pos = T - 1 + i  # verification position
+                if pos >= verify_logits.size(1):
+                    break
+                    
+                v_logits = verify_logits[:, pos, :]
+                if top_k is not None:
+                    v, _ = torch.topk(v_logits, min(top_k, v_logits.size(-1)))
+                    v_logits[v_logits < v[:, [-1]]] = -float('Inf')
+                
+                if temperature > 0:
+                    v_logits = v_logits / temperature
+                    v_probs = F.softmax(v_logits, dim=-1)
+                    verified_token = torch.multinomial(v_probs, num_samples=1, generator=rng)
+                else:
+                    verified_token = torch.argmax(v_logits, dim=-1, keepdim=True)
+                
+                # Check if draft matches verification
+                if i < draft_n and draft_tokens[0, i] == verified_token[0, 0]:
+                    accepted.append(verified_token[0, 0].item())
+                else:
+                    # Draft wrong, accept verified token and stop
+                    accepted.append(verified_token[0, 0].item())
+                    break
+            
+            # Yield accepted tokens
+            for tok in accepted:
+                if tokens_generated >= max_tokens:
+                    return
+                yield tok
+                tokens_generated += 1
+            
+            # Update ids with accepted tokens
+            accepted_tensor = torch.tensor([accepted], dtype=torch.long, device=device)
+            ids = torch.cat([ids, accepted_tensor], dim=1)
