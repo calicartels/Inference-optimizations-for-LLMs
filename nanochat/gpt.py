@@ -10,6 +10,7 @@ Notable features:
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
 - Multi-Query Attention (MQA) option for maximum KV cache compression
+- Multi-Token Prediction heads for improved training signal
 - Flash Attention 3 integration
 """
 
@@ -42,6 +43,9 @@ class GPTConfig:
     # Multi-Query Attention: use single KV head for all query heads that can be shared across multiple query heads, 
     # Reduces KV cache by n_head times 
     use_mqa: bool = False
+    # Multi-Token Prediction: extra heads predicting future tokens (t+2, t+3, t+4)
+    # Improves training signal and enables speculative decoding
+    multi_token_n: int = 3  # predicts 3 future tokens (t+2, t+3, t+4)
     
     def __post_init__(self):
         if self.use_mqa:
@@ -174,6 +178,10 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Multi-token prediction heads: predict tokens at t+2, t+3, etc.
+        self.multi_token_heads = nn.ModuleDict()
+        for i in range(config.multi_token_n):
+            self.multi_token_heads[f"head_{i+2}"] = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -213,6 +221,9 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # Multi-token prediction heads (same init as lm_head)
+        for head in self.multi_token_heads.values():
+            torch.nn.init.normal_(head.weight, mean=0.0, std=0.001)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -345,15 +356,17 @@ class GPT(nn.Module):
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        multi_token_params = list(self.multi_token_heads.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(multi_token_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
         # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         adam_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+            dict(params=multi_token_params, lr=unembedding_lr * dmodel_lr_scale),  # same LR as lm_head
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
             dict(params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale),  # same LR as token embedding
             dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
@@ -373,7 +386,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_multi_token=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -400,14 +413,28 @@ class GPT(nn.Module):
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        
+        # Multi-token prediction heads (for training with future token prediction)
+        multi_token_logits = {}
+        if return_multi_token and self.multi_token_heads:
+            for name, head in self.multi_token_heads.items():
+                mt_logits = head(x)
+                mt_logits = mt_logits[..., :self.config.vocab_size]
+                mt_logits = mt_logits.float()
+                mt_logits = softcap * torch.tanh(mt_logits / softcap)
+                multi_token_logits[name] = mt_logits
 
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_multi_token:
+                return loss, logits, multi_token_logits
             return loss
         else:
             # inference: just return the logits directly
+            if return_multi_token:
+                return logits, multi_token_logits
             return logits
 
     @torch.inference_mode()
