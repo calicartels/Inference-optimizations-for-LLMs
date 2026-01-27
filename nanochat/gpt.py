@@ -282,7 +282,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(head.weight, mean=0.0, std=0.001)
         # Draft head: small std for fc1 (like other projections), zeros for fc2 (starts neutral)
         if self.draft_head is not None:
-            torch.nn.init.normal_(self.draft_head.fc1.weight, mean=0.0, std=n_embd**-0.5)
+            torch.nn.init.normal_(self.draft_head.fc1.weight, mean=0.0, std=self.config.n_embd**-0.5)
             torch.nn.init.zeros_(self.draft_head.fc2.weight)  # start with zero output
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)

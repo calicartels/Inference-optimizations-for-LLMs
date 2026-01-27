@@ -102,7 +102,7 @@ def build_model(checkpoint_dir, step, device, phase):
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
-    model.load_state_dict(model_data, strict=True, assign=True)
+    model.load_state_dict(model_data, strict=False, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
@@ -164,6 +164,7 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
 def load_model(source, *args, **kwargs):
     model_dir = {
         "base": "base_checkpoints",
+        "distill": "distill_checkpoints",
         "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",

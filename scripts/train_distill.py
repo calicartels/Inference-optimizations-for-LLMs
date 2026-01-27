@@ -18,6 +18,10 @@ from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 print_banner()
 
+# Create argument parser
+parser = argparse.ArgumentParser(description="Distillation training script")
+
+
 # Teacher model
 parser.add_argument("--teacher-tag", type=str, default="d34", help="Teacher model tag (e.g., d34)")
 parser.add_argument("--teacher-step", type=int, default=None, help="Teacher checkpoint step (None = latest)")
@@ -108,7 +112,7 @@ model_config_kwargs = dict(
     window_pattern=args.window_pattern,
     use_mqa=args.use_mqa,
     multi_token_n=3,  # Enable: predicts t+2, t+3, t+4
-    draft_n=4,  # Enable: draft head predicts 4 tokens ahead
+    draft_n=0,  # Enable: draft head predicts 4 tokens ahead
 )
 
 with torch.device("meta"):
@@ -308,7 +312,7 @@ while True:
         
         # Draft head loss (weight: 0.1)
         draft_loss_val = torch.tensor(0.0, device=device)
-        if orig_model.draft_head is not None:
+        if hasattr(student_model.config, "draft_n") and student_model.config.draft_n > 0:
             with torch.no_grad():
                 draft_loss_val = compute_draft_loss(orig_model, x, teacher_logits.float(), args.temperature)
             loss = loss + 0.1 * draft_loss_val
