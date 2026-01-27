@@ -82,7 +82,12 @@ python -m scripts.train_distill \
 - `temperature=4.0`: Softens teacher distribution. Higher = more exploration.
 - `alpha=0.7`: Distillation weight. 0.7 = 70% distill, 30% ground truth CE loss.
 
-**Note:** Multi-token heads and draft head are disabled during distillation (set to 0) since they don't get training signal from the teacher's main logits.
+**Training Components:**
+- Main loss: KL divergence (teacher) + cross-entropy (ground truth)
+- Multi-token loss (0.2x weight): Trains heads to predict t+2, t+3, t+4 simultaneously
+- Draft head loss (0.1x weight): Trains draft head to match teacher's future predictions
+
+All components train end-to-end in a single pass. The multi-token heads and draft head are now enabled and trained during distillation.
 
 ### 5. Structured Pruning
 

@@ -8,7 +8,7 @@ import wandb
 import torch
 
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.distill_loss import compute_combined_loss
+from nanochat.distill_loss import compute_combined_loss, compute_multi_token_loss, compute_draft_loss
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -107,8 +107,8 @@ model_config_kwargs = dict(
     n_embd=model_dim,
     window_pattern=args.window_pattern,
     use_mqa=args.use_mqa,
-    multi_token_n=0,  # Disabled for distillation (no training signal)
-    draft_n=0,  # Disabled for distillation (no training signal)
+    multi_token_n=3,  # Enable: predicts t+2, t+3, t+4
+    draft_n=4,  # Enable: draft head predicts 4 tokens ahead
 )
 
 with torch.device("meta"):
@@ -276,15 +276,20 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        # Student forward
+        # Student forward with multi-token heads
         with autocast_ctx:
-            student_logits = student_model(x)
+            student_output = student_model(x, return_multi_token=True)
+            if isinstance(student_output, tuple):
+                student_logits, student_multi = student_output
+            else:
+                student_logits = student_output
+                student_multi = {}
         
-        # Teacher forward (no grad, with autocast for efficiency)
+        # Teacher forward (no grad)
         with torch.no_grad(), autocast_ctx:
             teacher_logits = teacher_model(x)
         
-        # Combined loss (in fp32 for numerical stability)
+        # Main distillation loss
         loss, distill_loss, ce_loss = compute_combined_loss(
             student_logits.float(),
             teacher_logits.float(),
@@ -294,6 +299,19 @@ while True:
             ignore_index=-1,
             reduction='mean'
         )
+        
+        # Multi-token prediction loss (weight: 0.2)
+        mt_loss = torch.tensor(0.0, device=device)
+        if student_multi:
+            mt_loss = compute_multi_token_loss(student_multi, y, ignore_index=-1)
+            loss = loss + 0.2 * mt_loss
+        
+        # Draft head loss (weight: 0.1)
+        draft_loss_val = torch.tensor(0.0, device=device)
+        if orig_model.draft_head is not None:
+            with torch.no_grad():
+                draft_loss_val = compute_draft_loss(orig_model, x, teacher_logits.float(), args.temperature)
+            loss = loss + 0.1 * draft_loss_val
         
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
@@ -324,13 +342,18 @@ while True:
     # Logging
     smooth_train_loss = 0.99 * smooth_train_loss + 0.01 * train_loss.item()
     if step % 10 == 0:
-        print0(f"Step {step:05d} | Loss: {train_loss.item():.4f} (distill: {distill_loss.item():.4f}, ce: {ce_loss.item():.4f}) | LR: {adamw_optimizer.param_groups[0]['lr']:.6f} | Time: {step_time:.3f}s")
+        print0(f"Step {step:05d} | Loss: {train_loss.item():.4f} "
+               f"(distill: {distill_loss.item():.4f}, ce: {ce_loss.item():.4f}, "
+               f"mt: {mt_loss.item():.4f}, draft: {draft_loss_val.item():.4f}) | "
+               f"LR: {adamw_optimizer.param_groups[0]['lr']:.6f} | Time: {step_time:.3f}s")
     
     wandb_run.log({
         "step": step,
         "train/loss": train_loss.item(),
         "train/distill_loss": distill_loss.item(),
         "train/ce_loss": ce_loss.item(),
+        "train/multi_token_loss": mt_loss.item(),
+        "train/draft_loss": draft_loss_val.item(),
         "train/smooth_loss": smooth_train_loss,
         "train/lr": adamw_optimizer.param_groups[0]["lr"],
         "train/step_time": step_time,

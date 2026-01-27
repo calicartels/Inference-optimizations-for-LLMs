@@ -107,3 +107,70 @@ def compute_combined_loss(
     
     return total_loss, distill_loss, ce_loss
 
+
+def compute_multi_token_loss(multi_token_logits, targets, ignore_index=-1, reduction='mean'):
+    """Train multi-token heads (t+2, t+3, t+4 predictions)"""
+    total_loss = 0.0
+    count = 0
+    
+    for head_name, logits in multi_token_logits.items():
+        offset = int(head_name.split('_')[1])  # "head_2" -> 2
+        
+        # Shift targets: head_2 predicts t+2, so target is y shifted by 1
+        if targets.size(1) >= offset:
+            shifted_targets = targets[:, offset-1:]
+            shifted_logits = logits[:, :targets.size(1)-offset+1, :]
+            
+            if shifted_targets.numel() > 0:
+                loss = F.cross_entropy(
+                    shifted_logits.reshape(-1, shifted_logits.size(-1)),
+                    shifted_targets.reshape(-1),
+                    ignore_index=ignore_index,
+                    reduction=reduction
+                )
+                total_loss += loss
+                count += 1
+    
+    return total_loss / count if count > 0 else torch.tensor(0.0, device=targets.device)
+
+
+def compute_draft_loss(student_model, x, teacher_logits, temperature=1.0):
+    """Train draft head to predict multiple future tokens"""
+    if student_model.draft_head is None:
+        return torch.tensor(0.0, device=x.device)
+    
+    # Get hidden states from last transformer layer
+    from nanochat.gpt import norm
+    hidden = student_model.transformer.wte(x)
+    hidden = norm(hidden)
+    x0 = hidden
+    
+    for i, block in enumerate(student_model.transformer.h):
+        hidden = student_model.resid_lambdas[i] * hidden + student_model.x0_lambdas[i] * x0
+        ve = student_model.value_embeds[str(i)](x) if str(i) in student_model.value_embeds else None
+        cos_sin = student_model.cos[:, :x.size(1)], student_model.sin[:, :x.size(1)]
+        hidden = block(hidden, ve, cos_sin, student_model.window_sizes[i], None)
+    
+    hidden = norm(hidden)
+    last_hidden = hidden[:, -1, :]  # (B, n_embd)
+    
+    # Draft head predicts next N tokens
+    draft_logits = student_model.draft_head(last_hidden)  # (B, draft_n, vocab)
+    
+    # Match with teacher's future predictions
+    B, T, V = teacher_logits.shape
+    draft_n = draft_logits.shape[1]
+    
+    total_loss = 0.0
+    for i in range(min(draft_n, T-1)):
+        draft_pred = draft_logits[:, i, :]
+        teacher_future = teacher_logits[:, i+1, :]
+        
+        student_log_probs = F.log_softmax(draft_pred / temperature, dim=-1)
+        teacher_probs = F.softmax(teacher_future / temperature, dim=-1)
+        
+        kl = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean', log_target=False)
+        total_loss += kl
+    
+    return total_loss / min(draft_n, T-1) if T > 1 else torch.tensor(0.0, device=x.device)
+
