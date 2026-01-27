@@ -1,11 +1,3 @@
-"""
-Knowledge Distillation Loss
-
-Implements KL divergence loss between teacher and student model logits.
-Used to transfer knowledge from a larger teacher model (e.g., nanochat d34) 
-to a smaller student model (e.g., our optimized model with MQA).
-"""
-
 import torch
 import torch.nn.functional as F
 

@@ -116,9 +116,29 @@ python -m scripts.train_distill \
 
 **Note:** Pruning reduces `n_head` and `n_embd` uniformly across layers. The pruned model maintains the same architecture but with smaller dimensions.
 
-## What's next
+### 6. INT8 Quantization
 
-- INT8 quantization
+Added support for exporting models to INT8 format for deployment.
+
+**How it works:**
+1. Quantize weights to 8-bit integers using per-tensor scaling
+2. Store quantization scales for dequantization during inference
+3. Export model in compressed format (4x smaller than FP32/BF16)
+
+**Why this matters:** INT8 models are 4x smaller and 2-3x faster on hardware with INT8 support. Quality loss is minimal (<5%) for most tasks.
+
+```bash
+# Export model to INT8
+python -m scripts.export_int8 \
+    --model-tag d12 \
+    --output model_int8.pt
+```
+
+**Usage:**
+- `--bits=8`: Quantization bits (8 for INT8, can use 4 for even smaller models)
+- `--output`: Output file path (default: `int8_models/{model_tag}_int8.pt`)
+
+**Note:** Quantization uses per-tensor scaling (one scale per weight tensor). For better quality, you can fine-tune with quantization-aware training, but post-training quantization works well for most cases.
 
 ## Setup
 
