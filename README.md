@@ -8,7 +8,7 @@ I rented a Vast.ai A100 instance, and the goal is to keep costs low — not trai
 
 ## TL;DR
 
-I wanted to experiment with different inference optimization techniques beyond what Karpathy included in nanochat, which in itself was pretty updated.
+I wanted to experiment with different inference optimization techniques beyond what Karpathy included in nanochat, which in itself was pretty updated. So this is what I set out do and what I achieved in doing so:
 
 - **Built a working distillation pipeline** with MQA, multi-token heads, INT8 quantization, there's code and the pipeline works,but I'm on a limited budget and couldn't afford full training runs with a properly-trained teacher
 - **Fixed a couple of bugs** in nanochat's distillation code for modern PyTorch, esp the quantization update code

@@ -24,3 +24,8 @@ jinja2>=3.1.0
 tabulate>=0.9.0
 matplotlib>=3.10.0
 scipy>=1.15.0
+
+
+torch
+gradio
+huggingface_hub
