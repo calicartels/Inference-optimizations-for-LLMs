@@ -1,4 +1,4 @@
-# LLM Inference Optimizations
+# PicoChat: nanochat, but under 10$ with distillation and pruning + inference optimizations
 
 Implementing inference optimizations for Large Language Models using nanochat as the base.
 
