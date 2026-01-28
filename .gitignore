@@ -201,6 +201,19 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# wandb
+wandb/
+
+# model / artifact outputs
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# local scratch / logs accidentally created by pip, etc.
+=*
+*.patch
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

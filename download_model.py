@@ -10,4 +10,4 @@ snapshot_download(
     repo_type="model"
 )
 
-print("✅ Download complete!")
+print("Downloaded")

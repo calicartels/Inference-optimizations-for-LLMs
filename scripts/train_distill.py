@@ -23,6 +23,7 @@ parser = argparse.ArgumentParser(description="Distillation training script")
 
 
 # Teacher model
+parser.add_argument("--teacher-source", type=str, default="base", help="Teacher model source: base|distill|mid|sft|rl")
 parser.add_argument("--teacher-tag", type=str, default="d34", help="Teacher model tag (e.g., d34)")
 parser.add_argument("--teacher-step", type=int, default=None, help="Teacher checkpoint step (None = latest)")
 # Student model architecture
@@ -80,8 +81,8 @@ else:
     print0("Flash Attention 3 not available, using PyTorch SDPA fallback")
 
 # Load Teacher Model
-print0(f"Loading teacher model: {args.teacher_tag}")
-teacher_model, tokenizer, teacher_meta = load_model("base", device, phase="eval", model_tag=args.teacher_tag, step=args.teacher_step)
+print0(f"Loading teacher model: {args.teacher_source}/{args.teacher_tag}")
+teacher_model, tokenizer, teacher_meta = load_model(args.teacher_source, device, phase="eval", model_tag=args.teacher_tag, step=args.teacher_step)
 teacher_model.eval()
 teacher_step = teacher_meta.get('step', 'unknown')
 print0(f"Teacher loaded (step {teacher_step}, vocab_size={teacher_model.config.vocab_size})")
@@ -112,7 +113,7 @@ model_config_kwargs = dict(
     window_pattern=args.window_pattern,
     use_mqa=args.use_mqa,
     multi_token_n=3,  # Enable: predicts t+2, t+3, t+4
-    draft_n=0,  # Enable: draft head predicts 4 tokens ahead
+    draft_n=4,  # Enable: draft head predicts 4 tokens ahead
 )
 
 with torch.device("meta"):
